@@ -64,7 +64,7 @@ def validate(agent, val_words, device=None, batch_size=cfg.VAL_BATCH_SIZE,
     Does NOT train the model.
     """
     if val_words is None or len(val_words) == 0:
-        print("[Validation] no words")
+        print("[Validation] no words", flush=True)
         return {"win_rate": 0.0, "avg_wrong": 0.0, "avg_total_guesses": 0.0,
                 "solved": 0, "total": 0}
 
@@ -150,7 +150,7 @@ def validate(agent, val_words, device=None, batch_size=cfg.VAL_BATCH_SIZE,
     avg_wrong = total_wrong_sum / max(1, total)
     avg_total = total_guesses_sum / max(1, total)
     print(f"[Validation] win_rate={win_rate*100:.2f}% solved={total_solved}/{total} "
-          f"avg_wrong={avg_wrong:.3f} avg_total_guesses={avg_total:.3f}")
+          f"avg_wrong={avg_wrong:.3f} avg_total_guesses={avg_total:.3f}", flush=True)
     return {"win_rate": win_rate, "avg_wrong": avg_wrong,
             "avg_total_guesses": avg_total, "solved": int(total_solved),
             "total": total}

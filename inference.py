@@ -115,7 +115,7 @@ def generate_submission(agent, test_words, out_path=cfg.BEST_MODEL_PATH,
             assert all("a" <= c <= "z" for c in gstr), f"bad guess string {gstr!r}"
             assert len(gstr) == len(set(gstr)), f"repeated guess in {gstr!r}"
             w.writerow([wid, gstr])
-    print(f"[submission] wrote {len(rows)} rows -> {out_csv}")
+    print(f"[submission] wrote {len(rows)} rows -> {out_csv}", flush=True)
     return out_csv
 
 
@@ -136,7 +136,7 @@ def verify_submission(path, expected_n=None):
             assert len(gstr) == len(set(gstr)), f"repeated guess {gstr!r}"
             prev = wid
             n += 1
-    print(f"[verify] OK: {n} rows, contiguous word_id 0..{n-1}, all lowercase a-z, no repeats.")
+    print(f"[verify] OK: {n} rows, contiguous word_id 0..{n-1}, all lowercase a-z, no repeats.", flush=True)
     if expected_n is not None:
         assert n == expected_n, f"expected {expected_n} rows got {n}"
     return n
@@ -144,13 +144,13 @@ def verify_submission(path, expected_n=None):
 
 if __name__ == "__main__":
     test_words = load_words(cfg.TEST_FILE)
-    print(f"[inference] {len(test_words)} test words")
+    print(f"[inference] {len(test_words)} test words", flush=True)
     model = CanineHangmanModel().to(cfg.DEVICE)
     agent = HangmanAgent(model)
     if os.path.exists(cfg.BEST_MODEL_PATH):
         ckpt = torch.load(cfg.BEST_MODEL_PATH, map_location=cfg.DEVICE)
         model.load_state_dict(ckpt["model_state_dict"])
     else:
-        print("[inference] no checkpoint found; using random model.")
+        print("[inference] no checkpoint found; using random model.", flush=True)
     generate_submission(agent, test_words, out_csv="submission.csv")
     verify_submission("submission.csv", expected_n=len(test_words))

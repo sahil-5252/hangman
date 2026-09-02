@@ -43,6 +43,45 @@ A self-contained pipeline for the Meltwater Hangman hackathon: trains a CANINE-S
 | `sanity_checks.py` | CPU sanity checks (all must pass) |
 | `notebook.ipynb` | Self-contained Kaggle notebook (no local imports) |
 
+## CLI Flags
+
+All hyperparameters can be overridden via `--key value` flags on any script:
+
+```bash
+# Training with custom params
+python train.py --phase1_epochs 5 --lr 1e-4 --self_play_rounds 3
+
+# Quick sanity check with overrides
+python sanity_checks.py --phase1_epochs 1 --self_play_rounds 0
+
+# Inference on CPU with limited validation
+python inference.py --device cpu --val_words 500
+
+# Change data location (e.g. Kaggle)
+python train.py --data_dir /kaggle/input/meltwater-hangman
+```
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--phase1_epochs` | 3 | Number of Phase 1 (MC supervised) epochs |
+| `--self_play_rounds` | 2 | Number of Phase 2 self-play rounds |
+| `--self_play_epochs_per_round` | 1 | Epochs per self-play round |
+| `--lr` | 3e-4 | Learning rate |
+| `--batch_size` | 512 | Training batch size |
+| `--val_batch_size` | 4096 | Validation/inference batch size |
+| `--max_train_steps` | None | Cap on optimizer steps per epoch |
+| `--max_mc_words_per_epoch` | 0 | Limit MC words per epoch (0 = all) |
+| `--dropout` | 0.1 | Model dropout |
+| `--model_dim` | 256 | Transformer hidden dimension |
+| `--num_layers` | 4 | Transformer encoder layers |
+| `--num_heads` | 4 | Attention heads |
+| `--correct_guess_prob` | 0.40 | MC correct-letter bias |
+| `--mc_mix_ratio` | 0.30 | Self-play MC mix fraction |
+| `--val_split_ratio` | 0.10 | Validation split fraction |
+| `--device` | cuda/cpu | Device to run on |
+| `--data_dir` | ./data | Path to data directory |
+| `--seed` | 1920 | Random seed |
+
 ## Local Testing
 
 ```bash

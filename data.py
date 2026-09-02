@@ -289,7 +289,7 @@ def generate_mc_states(words, rng=None, correct_rate=cfg.CORRECT_GUESS_PROB,
         total += 1
         total_solved += int(solved)
     print(f"[{desc}] states={len(all_state_tuples)} words={total} "
-          f"solved={total_solved}/{total} win_rate={total_solved/max(1,total):.3f}")
+          f"solved={total_solved}/{total} win_rate={total_solved/max(1,total):.3f}", flush=True)
     if not all_state_tuples:
         # avoid empty encoder crash
         empty = (("", (False,), "a"))

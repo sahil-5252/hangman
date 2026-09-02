@@ -126,10 +126,10 @@ def run_pipeline():
     set_seed(cfg.SEED)
     device = torch.device(get_device())
     # allow numpy bool scalar in soft targets:
-    print(f"[setup] device={device} amp={cfg.USE_AMP} seed={cfg.SEED}")
+    print(f"[setup] device={device} amp={cfg.USE_AMP} seed={cfg.SEED}", flush=True)
 
     train_words, val_words = prepare_splits()
-    print(f"[data] train={len(train_words)} val={len(val_words)}")
+    print(f"[data] train={len(train_words)} val={len(val_words)}", flush=True)
 
     model = build_model().to(device)
     agent = HangmanAgent(model)
@@ -147,7 +147,7 @@ def run_pipeline():
 
     # ---------------- Phase 1 ----------------
     for epoch in range(1, cfg.PHASE1_EPOCHS + 1):
-        print(f"\n=== Phase 1: Monte-Carlo supervised | epoch {epoch} ===")
+        print(f"\n=== Phase 1: Monte-Carlo supervised | epoch {epoch} ===", flush=True)
         dataset = generate_mc_states(mc_words,
                                      np.random.RandomState(cfg.SEED + epoch),
                                      desc=f"MC states e{epoch}")
@@ -163,9 +163,9 @@ def run_pipeline():
             if metrics["win_rate"] > best_val:
                 best_val = metrics["win_rate"]
                 save_checkpoint(model, best_path, metrics)
-                print(f"[best] new best val win_rate={best_val:.4f} -> {best_path}")
+                print(f"[best] new best val win_rate={best_val:.4f} -> {best_path}", flush=True)
         else:
-            print(f"[Phase1] epoch {epoch} loss={loss:.4f}")
+            print(f"[Phase1] epoch {epoch} loss={loss:.4f}", flush=True)
 
     # ---------------- Phase 2: self-play ----------------
     if cfg.SELF_PLAY_ROUNDS > 0:
@@ -174,11 +174,11 @@ def run_pipeline():
             ckpt = torch.load(best_path, map_location=device)
             model.load_state_dict(ckpt["model_state_dict"])
             agent = HangmanAgent(model)
-            print(f"[self-play] resumed best val model (win_rate={ckpt.get('metrics',{}).get('win_rate',0):.4f})")
+            print(f"[self-play] resumed best val model (win_rate={ckpt.get('metrics',{}).get('win_rate',0):.4f})", flush=True)
 
     for rnd in range(1, cfg.SELF_PLAY_ROUNDS + 1):
         for sub in range(cfg.SELF_PLAY_EPOCHS_PER_ROUND):
-            print(f"\n=== Phase 2: self-play | round {rnd} epoch {sub+1} ===")
+            print(f"\n=== Phase 2: self-play | round {rnd} epoch {sub+1} ===", flush=True)
             input_ids, attn, targets = rollout_selfplay(
                 agent, mc_words, desc=f"Self-play r{rnd}e{sub+1}")
             n_self = input_ids.shape[0]
@@ -197,14 +197,14 @@ def run_pipeline():
                 if metrics["win_rate"] > best_val:
                     best_val = metrics["win_rate"]
                     save_checkpoint(model, best_path, metrics)
-                    print(f"[best] new best val win_rate={best_val:.4f} -> {best_path}")
+                    print(f"[best] new best val win_rate={best_val:.4f} -> {best_path}", flush=True)
             else:
-                print(f"[SelfPlay] r{rnd} e{sub+1} loss={loss:.4f}")
+                print(f"[SelfPlay] r{rnd} e{sub+1} loss={loss:.4f}", flush=True)
 
     # final save
     final_path = os.path.join(cfg.CHECKPOINT_DIR, "final_model.pt")
     save_checkpoint(model, final_path, {"best_val": best_val})
-    print(f"[done] final model -> {final_path}; best_val={best_val:.4f}")
+    print(f"[done] final model -> {final_path}; best_val={best_val:.4f}", flush=True)
     return model, agent, best_val
 
 
@@ -234,4 +234,9 @@ class _MixedDataset(torch.utils.data.Dataset):
             return (self.sp_ids[idx], self.sp_attn[idx], self.sp_tgt[idx])
         m = idx - len(self.sp_ids)
         return (self.mc_ids[m], self.mc_attn[m], self.mc_tgt[m])
+
+
+if __name__ == "__main__":
+    run_pipeline()
+
 
