@@ -24,6 +24,7 @@ def _parse_cli():
                   "val_at_end_of_selfplay"}
     _KNOWN = {
         "data_dir", "base_dir", "checkpoint_dir", "best_model_path",
+        "load_checkpoint",
         "seed", "val_split_ratio", "final_full_data",
         "model_dim", "num_heads", "num_layers", "ff_dim", "dropout",
         "max_seq_len", "max_word_len",
@@ -99,7 +100,10 @@ VAL_SPLIT_CSV = os.path.join(DATA_DIR, "val_split.csv")
 
 CHECKPOINT_DIR = os.path.join(BASE_DIR, "checkpoints")
 BEST_MODEL_PATH = os.path.join(CHECKPOINT_DIR, "best_model.pt")
+METRICS_LOG = os.path.join(BASE_DIR, "training_log.csv")
 os.makedirs(CHECKPOINT_DIR, exist_ok=True)
+
+LOAD_CHECKPOINT = ""  # path to checkpoint to resume training from (empty = train from scratch)
 
 # ---------------------------------------------------------------------------
 # Reproducibility

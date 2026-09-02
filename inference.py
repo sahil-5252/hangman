@@ -147,10 +147,15 @@ if __name__ == "__main__":
     print(f"[inference] {len(test_words)} test words", flush=True)
     model = CanineHangmanModel().to(cfg.DEVICE)
     agent = HangmanAgent(model)
-    if os.path.exists(cfg.BEST_MODEL_PATH):
-        ckpt = torch.load(cfg.BEST_MODEL_PATH, map_location=cfg.DEVICE)
+
+    # Determine which checkpoint to load
+    ckpt_path = cfg.LOAD_CHECKPOINT if cfg.LOAD_CHECKPOINT else cfg.BEST_MODEL_PATH
+    if os.path.exists(ckpt_path):
+        ckpt = torch.load(ckpt_path, map_location=cfg.DEVICE, weights_only=False)
         model.load_state_dict(ckpt["model_state_dict"])
+        print(f"[inference] loaded checkpoint: {ckpt_path}", flush=True)
     else:
         print("[inference] no checkpoint found; using random model.", flush=True)
+
     generate_submission(agent, test_words, out_csv="submission.csv")
     verify_submission("submission.csv", expected_n=len(test_words))

@@ -10,6 +10,7 @@ trained with the SAME soft-target CrossEntropyLoss.  The best model is saved
 according to held-out validation Hangman win rate.
 """
 import os
+import csv
 import time
 import numpy as np
 import torch
@@ -22,6 +23,50 @@ from data import set_seed, generate_mc_states, load_splits, prepare_splits, \
 from model import CanineHangmanModel, HangmanAgent
 from evaluate import validate
 from selfplay import rollout_selfplay
+
+
+class MetricsLogger:
+    """Append-only CSV logger for training and validation metrics."""
+
+    COLUMNS = [
+        "timestamp", "phase", "epoch", "round",
+        "train_loss", "train_acc", "lr",
+        "val_win_rate", "val_avg_wrong", "val_avg_guesses",
+        "val_solved", "val_total",
+        "checkpoint_path", "notes",
+    ]
+
+    def __init__(self, path=cfg.METRICS_LOG):
+        self.path = path
+        self._init_file()
+
+    def _init_file(self):
+        write_header = not os.path.exists(self.path) or os.path.getsize(self.path) == 0
+        if write_header:
+            with open(self.path, "w", newline="", encoding="utf-8") as f:
+                csv.writer(f).writerow(self.COLUMNS)
+
+    def log(self, phase, epoch, train_loss=None, train_acc=None, lr=None,
+            val_metrics=None, round_n=None, checkpoint_path="", notes=""):
+        from datetime import datetime, timezone
+        row = {c: "" for c in self.COLUMNS}
+        row["timestamp"] = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+        row["phase"] = phase
+        row["epoch"] = epoch
+        row["round"] = round_n if round_n is not None else ""
+        row["train_loss"] = f"{train_loss:.6f}" if train_loss is not None else ""
+        row["train_acc"] = f"{train_acc:.6f}" if train_acc is not None else ""
+        row["lr"] = f"{lr:.8f}" if lr is not None else ""
+        if val_metrics:
+            row["val_win_rate"] = f"{val_metrics.get('win_rate', ''):.6f}" if 'win_rate' in val_metrics else ""
+            row["val_avg_wrong"] = f"{val_metrics.get('avg_wrong', ''):.6f}" if 'avg_wrong' in val_metrics else ""
+            row["val_avg_guesses"] = f"{val_metrics.get('avg_total_guesses', ''):.6f}" if 'avg_total_guesses' in val_metrics else ""
+            row["val_solved"] = val_metrics.get("solved", "")
+            row["val_total"] = val_metrics.get("total", "")
+        row["checkpoint_path"] = checkpoint_path
+        row["notes"] = notes
+        with open(self.path, "a", newline="", encoding="utf-8") as f:
+            csv.writer(f).writerow([row[c] for c in self.COLUMNS])
 
 
 def get_device():
@@ -69,11 +114,13 @@ def train_epoch(model, dataset, optim, scheduler, scaler, loss_fn, epoch, phase,
         dataset, batch_size=cfg.BATCH_SIZE, shuffle=True,
         collate_fn=collate, drop_last=False)
     if len(dataset) == 0:
-        return 0.0, 0
+        return 0.0, 0, 0.0
     use_amp = cfg.USE_AMP and device.type != "cpu"
     step = 0
     running_loss = 0.0
+    correct = 0
     seen = 0
+    last_lr = optim.param_groups[0]["lr"]
     pbar = tqdm(loader, desc=f"[{phase} epoch {epoch}] train", unit="batch")
     for batch in pbar:
         input_ids, attn, targets = batch
@@ -98,13 +145,17 @@ def train_epoch(model, dataset, optim, scheduler, scaler, loss_fn, epoch, phase,
         if scheduler is not None:
             scheduler.step()
         running_loss += loss.item()
-        seen += 1
+        # accuracy: argmax of logits vs argmax of soft targets
+        correct += (logits.argmax(dim=-1) == targets.argmax(dim=-1)).sum().item()
+        seen += targets.shape[0]
         step += 1
-        pbar.set_postfix({"loss": f"{running_loss/max(1,seen):.4f}", "steps": step})
+        last_lr = optim.param_groups[0]["lr"]
+        pbar.set_postfix({"loss": f"{running_loss/max(1,step):.4f}",
+                          "acc": f"{correct/max(1,seen):.4f}", "steps": step})
         if max_steps is not None and step >= max_steps:
             break
     pbar.close()
-    return running_loss / max(1, seen), step
+    return running_loss / max(1, step), step, correct / max(1, seen)
 
 
 @torch.no_grad()
@@ -131,7 +182,17 @@ def run_pipeline():
     train_words, val_words = prepare_splits()
     print(f"[data] train={len(train_words)} val={len(val_words)}", flush=True)
 
+    logger = MetricsLogger()
     model = build_model().to(device)
+
+    # Load from checkpoint if specified
+    if cfg.LOAD_CHECKPOINT and os.path.exists(cfg.LOAD_CHECKPOINT):
+        ckpt = torch.load(cfg.LOAD_CHECKPOINT, map_location=device, weights_only=False)
+        model.load_state_dict(ckpt["model_state_dict"])
+        print(f"[setup] loaded checkpoint: {cfg.LOAD_CHECKPOINT}", flush=True)
+        if "metrics" in ckpt and ckpt["metrics"]:
+            print(f"[setup] checkpoint metrics: {ckpt['metrics']}", flush=True)
+
     agent = HangmanAgent(model)
     optim = make_optim(model)
     # total phase1 steps estimate
@@ -140,6 +201,7 @@ def run_pipeline():
 
     best_val = -1.0
     best_path = cfg.BEST_MODEL_PATH
+    ckpt_dir = cfg.CHECKPOINT_DIR
 
     mc_words = train_words
     if cfg.MAX_MC_WORDS_PER_EPOCH and cfg.MAX_MC_WORDS_PER_EPOCH > 0:
@@ -154,24 +216,36 @@ def run_pipeline():
         optim_cur = make_optim(model)  # fresh optimiser per phase-1 epoch
         sched = make_scheduler(optim_cur, max(1, len(dataset) // cfg.BATCH_SIZE))
         scaler = torch.amp.GradScaler("cuda", enabled=(cfg.USE_AMP and device.type != "cpu"))
-        loss, steps = train_epoch(model, dataset, optim_cur, sched, scaler,
+        loss, steps, train_acc = train_epoch(model, dataset, optim_cur, sched, scaler,
                                   loss_fn, epoch, "Phase1",
                                   max_steps=cfg.MAX_TRAIN_STEPS, device=device)
         agent.model = model
+        last_lr = optim_cur.param_groups[0]["lr"]
+
+        # Save per-epoch checkpoint
+        ep_ckpt_path = os.path.join(ckpt_dir, f"phase1_e{epoch}.pt")
+        save_checkpoint(model, ep_ckpt_path, {"loss": loss, "epoch": epoch, "phase": "phase1"})
+        print(f"[checkpoint] saved {ep_ckpt_path}", flush=True)
+
+        val_metrics = {}
         if val_words:
-            metrics = run_validation(agent, val_words, "Phase1", epoch)
-            if metrics["win_rate"] > best_val:
-                best_val = metrics["win_rate"]
-                save_checkpoint(model, best_path, metrics)
+            val_metrics = run_validation(agent, val_words, "Phase1", epoch)
+            if val_metrics["win_rate"] > best_val:
+                best_val = val_metrics["win_rate"]
+                save_checkpoint(model, best_path, val_metrics)
                 print(f"[best] new best val win_rate={best_val:.4f} -> {best_path}", flush=True)
         else:
             print(f"[Phase1] epoch {epoch} loss={loss:.4f}", flush=True)
+
+        logger.log("Phase1", epoch, train_loss=loss, train_acc=train_acc,
+                    lr=last_lr, val_metrics=val_metrics if val_metrics else None,
+                    checkpoint_path=ep_ckpt_path)
 
     # ---------------- Phase 2: self-play ----------------
     if cfg.SELF_PLAY_ROUNDS > 0:
         # re-load best model if we have validation
         if os.path.exists(best_path):
-            ckpt = torch.load(best_path, map_location=device)
+            ckpt = torch.load(best_path, map_location=device, weights_only=False)
             model.load_state_dict(ckpt["model_state_dict"])
             agent = HangmanAgent(model)
             print(f"[self-play] resumed best val model (win_rate={ckpt.get('metrics',{}).get('win_rate',0):.4f})", flush=True)
@@ -188,23 +262,38 @@ def run_pipeline():
             optim_cur = make_optim(model)
             sched = make_scheduler(optim_cur, max(1, len(dataset) // cfg.BATCH_SIZE))
             scaler = torch.amp.GradScaler("cuda", enabled=(cfg.USE_AMP and device.type != "cpu"))
-            loss, steps = train_epoch(model, dataset, optim_cur, sched, scaler,
+            loss, steps, train_acc = train_epoch(model, dataset, optim_cur, sched, scaler,
                                       loss_fn, sub + 1, f"SelfPlay r{rnd}",
                                       max_steps=cfg.MAX_TRAIN_STEPS, device=device)
             agent.model = model
+            last_lr = optim_cur.param_groups[0]["lr"]
+
+            # Save per-epoch checkpoint
+            ep_ckpt_path = os.path.join(ckpt_dir, f"selfplay_r{rnd}_e{sub+1}.pt")
+            save_checkpoint(model, ep_ckpt_path, {"loss": loss, "epoch": sub+1,
+                                                   "round": rnd, "phase": "selfplay"})
+            print(f"[checkpoint] saved {ep_ckpt_path}", flush=True)
+
+            val_metrics = {}
             if val_words:
-                metrics = run_validation(agent, val_words, "SelfPlay", sub + 1, round_n=rnd)
-                if metrics["win_rate"] > best_val:
-                    best_val = metrics["win_rate"]
-                    save_checkpoint(model, best_path, metrics)
+                val_metrics = run_validation(agent, val_words, "SelfPlay", sub + 1, round_n=rnd)
+                if val_metrics["win_rate"] > best_val:
+                    best_val = val_metrics["win_rate"]
+                    save_checkpoint(model, best_path, val_metrics)
                     print(f"[best] new best val win_rate={best_val:.4f} -> {best_path}", flush=True)
             else:
                 print(f"[SelfPlay] r{rnd} e{sub+1} loss={loss:.4f}", flush=True)
+
+            logger.log("SelfPlay", sub + 1, train_loss=loss, train_acc=train_acc,
+                        lr=last_lr, val_metrics=val_metrics if val_metrics else None,
+                        round_n=rnd, checkpoint_path=ep_ckpt_path,
+                        notes=f"selfplay_states={n_self}")
 
     # final save
     final_path = os.path.join(cfg.CHECKPOINT_DIR, "final_model.pt")
     save_checkpoint(model, final_path, {"best_val": best_val})
     print(f"[done] final model -> {final_path}; best_val={best_val:.4f}", flush=True)
+    print(f"[done] training log -> {cfg.METRICS_LOG}", flush=True)
     return model, agent, best_val
 
 
