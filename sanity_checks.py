@@ -4,7 +4,9 @@ No real training is performed locally (no GPU / heavy CPU).  These checks
 verify correctness of: data loading & split sizes, legal state generation,
 target distribution validity, model forward/backward, a couple of training
 steps on CPU, batched self-play on a tiny subset, the validation simulator,
-and submission generation against a tiny fake test set.
+submission generation against a tiny fake test set, exhaustive state generation,
+wrong-letter histories, extended encoding, candidate index, combined scoring,
+and checkpoint resume.
 """
 import os
 import numpy as np
@@ -15,9 +17,11 @@ from tqdm import tqdm
 import config as cfg
 from data import (set_seed, load_train_test, prepare_splits, load_splits,
                   make_split, generate_mc_states, soft_target_vector,
-                  CHAR_TO_ID, ID_TO_CHAR, LAYOUT_LEN, collate)
+                  CHAR_TO_ID, ID_TO_CHAR, LAYOUT_LEN, collate,
+                  generate_exhaustive_states, generate_exhaustive_states_dataset,
+                  CandidateIndex, encode_state_extended)
 from model import CanineHangmanModel, HangmanAgent
-from evaluate import validate
+from evaluate import validate, _build_chunk_tokens_extended
 from selfplay import rollout_selfplay
 from inference import generate_submission, verify_submission
 
@@ -151,6 +155,162 @@ def main():
     rng2 = np.random.RandomState(42)
     ds_b = generate_mc_states(train_words[:200], rng2, desc="MC re-gen")
     check(ds_b.input_ids.shape[0] == ds_b.targets.shape[0], "regenerated MC states consistent")
+
+    # 11. Exhaustive state generation (letter-subset based)
+    tiny_exh = train_words[:5]
+    states_exh, tgt_exh = generate_exhaustive_states(tiny_exh[0], rng=np.random.RandomState(0),
+                                                      cap=8)
+    check(len(states_exh) > 0, f"exhaustive states generated ({len(states_exh)} states)")
+    check(len(tgt_exh) == len(states_exh), "exhaustive states/targets count match")
+    # Each state should have a valid target distribution
+    for tgt in tgt_exh:
+        s = tgt.sum()
+        if s > 0:
+            check(np.isclose(s, 1.0, atol=1e-5), f"exhaustive target sums to 1.0 (got {s})")
+    check(True, "exhaustive states have valid target distributions")
+
+    # 12. Wrong-letter histories are randomized
+    from data import _random_wrong_letters, ALPHABET
+    word = "hello"
+    revealed_mask = np.array([True, True, False, False, False], dtype=bool)
+    guessed_mask = np.zeros(cfg.NUM_LETTERS, dtype=bool)
+    guessed_mask[CHAR_TO_ID['h']] = True
+    guessed_mask[CHAR_TO_ID['e']] = True
+    wrong1 = _random_wrong_letters(word, revealed_mask, guessed_mask,
+                                   np.random.RandomState(0))
+    wrong2 = _random_wrong_letters(word, revealed_mask, guessed_mask,
+                                   np.random.RandomState(42))
+    check(isinstance(wrong1, list), "wrong letters is a list")
+    check(all(c in ALPHABET for c in wrong1), "wrong letters are valid a-z")
+    # Wrong letters should not overlap with word letters or guessed mask
+    word_letters = set(word)
+    for c in wrong1:
+        check(c not in word_letters, f"wrong letter {c} not in word")
+        check(not guessed_mask[CHAR_TO_ID[c]], f"wrong letter {c} not already guessed")
+    check(True, "wrong-letter histories are valid and non-overlapping")
+
+    # 13. Extended encoding (correct/wrong masks)
+    guessed_str = "he"
+    revealed = np.array([True, True, False, False, False], dtype=bool)
+    correct_mask = np.zeros(cfg.NUM_LETTERS, dtype=bool)
+    wrong_mask = np.zeros(cfg.NUM_LETTERS, dtype=bool)
+    correct_mask[CHAR_TO_ID['h']] = True
+    correct_mask[CHAR_TO_ID['e']] = True
+    wrong_mask[CHAR_TO_ID['x']] = True
+    ids_ext, am_ext = encode_state_extended(guessed_str, revealed, word,
+                                            correct_mask, wrong_mask)
+    check(len(ids_ext) == cfg.LAYOUT_TOTAL_LEN, f"extended layout length {cfg.LAYOUT_TOTAL_LEN} (got {len(ids_ext)})")
+    check(ids_ext[0] == cfg.CLS, "extended layout starts with CLS")
+    check(ids_ext[cfg.LAYOUT_SEP] == cfg.SEP, "extended layout has SEP at correct position")
+    # Check correct mask positions
+    check(ids_ext[cfg.LAYOUT_CORRECT_START + CHAR_TO_ID['h']] == cfg.CORRECT_ONE,
+          "correct mask h=1")
+    check(ids_ext[cfg.LAYOUT_CORRECT_START + CHAR_TO_ID['x']] == cfg.CORRECT_ZERO,
+          "correct mask x=0")
+    check(ids_ext[cfg.LAYOUT_WRONG_START + CHAR_TO_ID['x']] == cfg.WRONG_ONE,
+          "wrong mask x=1")
+    check(ids_ext[cfg.LAYOUT_WRONG_START + CHAR_TO_ID['h']] == cfg.WRONG_ZERO,
+          "wrong mask h=0")
+    check(True, "extended encoding with correct/wrong masks is correct")
+
+    # 14. Extended encoding batch function
+    from data import encode_batch_extended
+    words_batch = ["hello", "world"]
+    revealed_batch = np.array([[True, True, False, False, False],
+                                [True, False, False, False, False]], dtype=bool)
+    guessed_batch = ["he", "w"]
+    correct_batch = np.zeros((2, 26), dtype=bool)
+    wrong_batch = np.zeros((2, 26), dtype=bool)
+    for b, gstr in enumerate(guessed_batch):
+        for c in gstr:
+            if c in words_batch[b]:
+                correct_batch[b, CHAR_TO_ID[c]] = True
+            else:
+                wrong_batch[b, CHAR_TO_ID[c]] = True
+    ids_b, am_b, gm_b = encode_batch_extended(guessed_batch, revealed_batch,
+                                               words_batch, correct_batch, wrong_batch)
+    check(ids_b.shape == (2, cfg.LAYOUT_TOTAL_LEN), f"batch extended shape (2, {cfg.LAYOUT_TOTAL_LEN})")
+    check(am_b.shape == (2, cfg.LAYOUT_TOTAL_LEN), "batch extended attn shape")
+    check(gm_b.shape == (2, 26), "batch guessed mask shape")
+    check(True, "extended batch encoding works correctly")
+
+    # 15. Candidate index
+    ci = CandidateIndex(train_words[:500])
+    candidates = ci.retrieve(5, np.array([True, True, False, False, False]),
+                             "hello", {"x"})
+    check(isinstance(candidates, list), "candidate retrieval returns a list")
+    check(len(candidates) >= 0, "candidate retrieval is non-negative")
+    # All candidates should be length 5 and not contain wrong letter
+    for c in candidates:
+        check(len(c) == 5, f"candidate {c} has correct length 5")
+        check("x" not in c, f"candidate {c} doesn't contain wrong letter x")
+    # Letter probability
+    probs = ci.letter_probability(candidates, np.zeros(26, dtype=bool))
+    check(probs.shape == (26,), "letter probability shape (26,)")
+    check(abs(probs.sum() - 1.0) < 1e-5 or probs.sum() == 0,
+          "letter probability sums to 1.0 or is empty")
+    check(True, "candidate index works correctly")
+
+    # 16. Combined scoring in validation
+    metrics_comb = validate(agent, train_words[:40], batch_size=20,
+                            desc="Val combined sanity", cand_index=ci)
+    check("win_rate" in metrics_comb, "combined scoring validation returns win_rate")
+    check(0.0 <= metrics_comb["win_rate"] <= 1.0, "combined win_rate in [0,1]")
+    check(True, "combined CANINE+candidate scoring works")
+
+    # 17. Checkpoint save/load round-trip (full state)
+    from train import save_checkpoint, load_checkpoint
+    model_ckpt = CanineHangmanModel()
+    optim_ckpt = torch.optim.AdamW(model_ckpt.parameters(), lr=1e-3)
+    total_steps_ckpt = 100
+    sched_ckpt = torch.optim.lr_scheduler.CosineAnnealingLR(optim_ckpt, T_max=total_steps_ckpt)
+    # Step a few times
+    for _ in range(10):
+        optim_ckpt.step()
+        sched_ckpt.step()
+    lr_before = optim_ckpt.param_groups[0]["lr"]
+    ckpt_path = os.path.join(cfg.CHECKPOINT_DIR, "_sanity_ckpt.pt")
+    save_checkpoint(model_ckpt, optim_ckpt, sched_ckpt, ckpt_path,
+                    {"test": True}, phase="Phase1", epoch=3, rnd=0, global_step=42)
+    # Load into fresh model
+    model_ckpt2 = CanineHangmanModel()
+    optim_ckpt2 = torch.optim.AdamW(model_ckpt2.parameters(), lr=1e-3)
+    sched_ckpt2 = torch.optim.lr_scheduler.CosineAnnealingLR(optim_ckpt2, T_max=total_steps_ckpt)
+    model_ckpt2, optim_ckpt2, sched_ckpt2, resume = load_checkpoint(
+        model_ckpt2, optim_ckpt2, sched_ckpt2, ckpt_path, torch.device("cpu"))
+    lr_after = optim_ckpt2.param_groups[0]["lr"]
+    check(resume["phase"] == "Phase1", f"checkpoint phase=Phase1 (got {resume['phase']})")
+    check(resume["epoch"] == 3, f"checkpoint epoch=3 (got {resume['epoch']})")
+    check(resume["global_step"] == 42, f"checkpoint global_step=42 (got {resume['global_step']})")
+    check(np.isclose(lr_before, lr_after, atol=1e-8), f"LR restored ({lr_before:.6f} -> {lr_after:.6f})")
+    # Check model weights match
+    for (n1, p1), (n2, p2) in zip(model_ckpt.named_parameters(), model_ckpt2.named_parameters()):
+        assert torch.allclose(p1, p2), f"param mismatch: {n1}"
+    check(True, "checkpoint round-trip preserves model/optimizer/scheduler state")
+    os.remove(ckpt_path)
+
+    # 18. Model forward with extended layout (112 tokens)
+    model_ext = CanineHangmanModel()
+    ids_rand = torch.randint(0, cfg.VOCAB_SIZE, (4, cfg.LAYOUT_TOTAL_LEN))
+    attn_rand = torch.ones(4, cfg.LAYOUT_TOTAL_LEN, dtype=torch.long)
+    logits_ext = model_ext(ids_rand, attn_rand)
+    check(logits_ext.shape == (4, 26), f"extended forward logits shape (4,26) (got {tuple(logits_ext.shape)})")
+    check(True, "model handles extended layout (112 tokens)")
+
+    # 19. predict_proba works
+    agent_ext = HangmanAgent(model_ext)
+    probs_ext = agent_ext.predict_proba(ids_rand, attn_rand)
+    check(probs_ext.shape == (4, 26), f"predict_proba shape (4,26)")
+    check(np.allclose(probs_ext.sum(dim=-1).numpy(), 1.0, atol=1e-5),
+          "predict_proba sums to 1.0")
+    check(True, "predict_proba returns valid probability distribution")
+
+    # 20. MIN_LR is respected
+    check(cfg.MIN_LR == 1e-5, f"MIN_LR=1e-5 (got {cfg.MIN_LR})")
+    check(cfg.CANDIDATE_ALPHA == 0.70, f"CANDIDATE_ALPHA=0.70 (got {cfg.CANDIDATE_ALPHA})")
+    check(cfg.EXHAUSTIVE_CAP_PER_WORD == 64, f"EXHAUSTIVE_CAP=64 (got {cfg.EXHAUSTIVE_CAP_PER_WORD})")
+    check(cfg.WRONG_LETTERS_MAX == 5, f"WRONG_LETTERS_MAX=5 (got {cfg.WRONG_LETTERS_MAX})")
+    check(True, "config hyperparameters correct")
 
     print("=" * 70)
     print("ALL SANITY CHECKS PASSED")

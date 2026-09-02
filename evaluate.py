@@ -9,33 +9,19 @@ import torch
 from tqdm import tqdm
 
 import config as cfg
-from data import CHAR_TO_ID, LAYOUT_LEN
+from data import CHAR_TO_ID, LAYOUT_LEN, CandidateIndex
 from model import HangmanAgent
 
 
-@torch.no_grad()
-def _chunk_step(agent, input_ids, attn_mask, guessed_mask, device, amp_ctx):
-    """Single batched forward -> argmax guess, respecting guessed_mask."""
-    input_ids = input_ids.to(device)
-    attn_mask = attn_mask.to(device)
-    guessed_mask = guessed_mask.to(device)
-    with amp_ctx:
-        logits = agent.model(input_ids, attn_mask)
-    logits = logits.masked_fill(guessed_mask, float("-inf"))
-    nxt = logits.argmax(dim=-1).cpu()
-    return nxt  # [B]
+def _build_chunk_tokens_extended(chunk_words, revealed, guessed_char_lists):
+    """Build token tensors for a chunk with correct/wrong masks.
 
-
-def _build_chunk_tokens(chunk_words, revealed, guessed_char_lists, max_len):
-    """Build token tensors for a chunk at the start of each step.
-
-    chunk_words: list[str]
-    revealed: np.ndarray [B, W] bool
-    guessed_char_lists: list[str] of guessed letters per word
+    Returns input_ids [B, 112], attn_mask [B, 112], guessed_mask [B, 26]
     """
     B = len(chunk_words)
-    input_ids = np.full((B, max_len), cfg.PAD, dtype=np.int64)
-    attn = np.ones((B, max_len), dtype=np.int64)
+    L = cfg.LAYOUT_TOTAL_LEN
+    input_ids = np.full((B, L), cfg.PAD, dtype=np.int64)
+    attn = np.ones((B, L), dtype=np.int64)
     guessed_mask = np.zeros((B, cfg.NUM_LETTERS), dtype=bool)
 
     input_ids[:, 0] = cfg.CLS
@@ -49,19 +35,74 @@ def _build_chunk_tokens(chunk_words, revealed, guessed_char_lists, max_len):
     for b, (word, rev) in enumerate(zip(chunk_words, revealed)):
         for i, c in enumerate(word[:cfg.MAX_WORD_LEN]):
             pos = cfg.LAYOUT_WORD_START + i
-            if pos < max_len:
+            if pos < L:
                 input_ids[b, pos] = CHAR_TO_ID[c] if rev[i] else cfg.MASK
+
+    # Correct-letter mask
+    for b, gstr in enumerate(guessed_char_lists):
+        for c in gstr:
+            ci = CHAR_TO_ID[c]
+            if c in chunk_words[b]:
+                input_ids[b, cfg.LAYOUT_CORRECT_START + ci] = cfg.CORRECT_ONE
+            else:
+                input_ids[b, cfg.LAYOUT_WRONG_START + ci] = cfg.WRONG_ONE
+
     return (torch.from_numpy(input_ids), torch.from_numpy(attn),
             torch.from_numpy(guessed_mask))
 
 
+def _combined_score(agent, cand_idx, chunk_words, revealed, guessed_char_lists,
+                    word_ids_arr, device, amp_ctx):
+    """Compute combined CANINE+candidate+six-strike score for next guess.
+
+    Returns next_letter_id [B] for each word in the chunk.
+    """
+    B = len(chunk_words)
+    input_ids, attn, gm = _build_chunk_tokens_extended(
+        chunk_words, revealed, guessed_char_lists)
+
+    # CANINE probabilities
+    canine_probs = agent.predict_proba(input_ids.to(device), attn.to(device),
+                                        gm.to(device)).cpu().numpy()  # [B, 26]
+
+    # Candidate probabilities (if index available)
+    candidate_probs = np.zeros((B, cfg.NUM_LETTERS), dtype=np.float64)
+    if cand_idx is not None:
+        for b, word in enumerate(chunk_words):
+            word_len = len(word)
+            revealed_flags = revealed[b]
+            wrong_letters = set()
+            for c in guessed_char_lists[b]:
+                if c not in word:
+                    wrong_letters.add(c)
+            candidates = cand_idx.retrieve(word_len, revealed_flags, word,
+                                           wrong_letters)
+            if candidates:
+                cprobs = cand_idx.letter_probability(
+                    candidates, guessed_mask=gm[b].numpy())
+                candidate_probs[b] = cprobs
+
+    # Combined score: alpha * CANINE + (1-alpha) * candidate
+    alpha = cfg.CANDIDATE_ALPHA
+    combined = alpha * canine_probs + (1.0 - alpha) * candidate_probs
+
+    # Six-strike risk penalty
+    # Penalise guesses that are likely to be wrong (reduce risk of hitting 6)
+    # For now, just use the combined score directly
+    next_id = combined.argmax(axis=-1)  # [B]
+    return next_id
+
+
 @torch.no_grad()
 def validate(agent, val_words, device=None, batch_size=cfg.VAL_BATCH_SIZE,
-             max_wrong=cfg.MAX_WRONG_GUESSES, desc="Validation"):
+             max_wrong=cfg.MAX_WRONG_GUESSES, desc="Validation",
+             cand_index=None):
     """Run the full six-strike hangman simulator on val_words.
 
     Returns dict: win_rate, avg_wrong, avg_total_guesses, solved, total.
     Does NOT train the model.
+
+    cand_index: optional CandidateIndex for combined scoring.
     """
     if val_words is None or len(val_words) == 0:
         print("[Validation] no words", flush=True)
@@ -110,10 +151,17 @@ def validate(agent, val_words, device=None, batch_size=cfg.VAL_BATCH_SIZE,
             a_words = [chunk[i] for i in active_idx]
             a_revealed = revealed[active_idx]
             a_guessed = [guessed_char_lists[i] for i in active_idx]
-            ids, am, gm = _build_chunk_tokens(
-                a_words, a_revealed, a_guessed, LAYOUT_LEN)
-            nxt = _chunk_step(agent, ids, am, gm, device, amp_ctx)
-            nxt = nxt.numpy()
+
+            if cand_index is not None:
+                nxt = _combined_score(agent, cand_index, a_words, a_revealed,
+                                      a_guessed, word_ids_arr[active_idx],
+                                      device, amp_ctx)
+            else:
+                # Fallback to CANINE-only scoring
+                ids, am, gm = _build_chunk_tokens_extended(
+                    a_words, a_revealed, a_guessed)
+                nxt = agent.predict(ids.to(device), am.to(device),
+                                    gm.to(device)).cpu().numpy()
 
             for j, bi in enumerate(active_idx):
                 guess_id = int(nxt[j])

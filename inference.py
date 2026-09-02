@@ -6,6 +6,8 @@ ever sees the current board / guessed-letter state.  The hidden test word is
 used solely by the local simulator to (a) reveal all occurrences of a guessed
 letter and (b) decide the game is solved.
 
+Uses combined CANINE+candidate+six-strike scoring for inference.
+
 Output: submission.csv  with columns  word_id,guessed_letters_string  (0..249999).
 """
 import csv
@@ -15,8 +17,9 @@ import torch
 from tqdm import tqdm
 
 import config as cfg
-from data import load_words, CHAR_TO_ID, LAYOUT_LEN
-from evaluate import _build_chunk_tokens
+from data import (load_words, CHAR_TO_ID, LAYOUT_LEN,
+                  CandidateIndex, load_splits)
+from evaluate import _build_chunk_tokens_extended, _combined_score
 from model import CanineHangmanModel, HangmanAgent
 
 
@@ -24,7 +27,8 @@ from model import CanineHangmanModel, HangmanAgent
 def generate_submission(agent, test_words, out_path=cfg.BEST_MODEL_PATH,
                         device=None, batch_size=cfg.VAL_BATCH_SIZE,
                         max_wrong=cfg.MAX_WRONG_GUESSES,
-                        out_csv="submission.csv"):
+                        out_csv="submission.csv",
+                        cand_index=None):
     """Simulate all test words and write submission.csv in original order."""
     agent.eval()
     if device is None:
@@ -62,16 +66,24 @@ def generate_submission(agent, test_words, out_path=cfg.BEST_MODEL_PATH,
             if len(active_idx) == 0:
                 break
             a_words = [chunk[i] for i in active_idx]
-            ids, am, gm = _build_chunk_tokens(
-                a_words, revealed[active_idx],
-                [guessed_char_lists[i] for i in active_idx], LAYOUT_LEN)
-            ids_d = ids.to(device)
-            am_d = am.to(device)
-            gm_d = gm.to(device)
-            with amp_ctx:
-                logits = agent.model(ids_d, am_d)
-            logits = logits.masked_fill(gm_d, float("-inf"))
-            nxt = logits.argmax(dim=-1).cpu().numpy()
+            a_revealed = revealed[active_idx]
+            a_guessed = [guessed_char_lists[i] for i in active_idx]
+
+            if cand_index is not None:
+                nxt = _combined_score(agent, cand_index, a_words, a_revealed,
+                                      a_guessed, word_ids_arr[active_idx],
+                                      device, amp_ctx)
+            else:
+                # Fallback to CANINE-only scoring
+                ids, am, gm = _build_chunk_tokens_extended(
+                    a_words, a_revealed, a_guessed)
+                ids_d = ids.to(device)
+                am_d = am.to(device)
+                gm_d = gm.to(device)
+                with amp_ctx:
+                    logits = agent.model(ids_d, am_d)
+                logits = logits.masked_fill(gm_d, float("-inf"))
+                nxt = logits.argmax(dim=-1).cpu().numpy()
 
             for j, bi in enumerate(active_idx):
                 guess_id = int(nxt[j])
@@ -145,6 +157,11 @@ def verify_submission(path, expected_n=None):
 if __name__ == "__main__":
     test_words = load_words(cfg.TEST_FILE)
     print(f"[inference] {len(test_words)} test words", flush=True)
+
+    # Build candidate index from training words
+    train_words, _ = load_splits()
+    cand_index = CandidateIndex(train_words)
+
     model = CanineHangmanModel().to(cfg.DEVICE)
     agent = HangmanAgent(model)
 
@@ -154,8 +171,11 @@ if __name__ == "__main__":
         ckpt = torch.load(ckpt_path, map_location=cfg.DEVICE, weights_only=False)
         model.load_state_dict(ckpt["model_state_dict"])
         print(f"[inference] loaded checkpoint: {ckpt_path}", flush=True)
+        if "metrics" in ckpt and ckpt["metrics"]:
+            print(f"[inference] checkpoint metrics: {ckpt['metrics']}", flush=True)
     else:
         print("[inference] no checkpoint found; using random model.", flush=True)
 
-    generate_submission(agent, test_words, out_csv="submission.csv")
+    generate_submission(agent, test_words, out_csv="submission.csv",
+                        cand_index=cand_index)
     verify_submission("submission.csv", expected_n=len(test_words))

@@ -12,7 +12,7 @@ from tqdm import tqdm
 
 import config as cfg
 from data import CHAR_TO_ID, soft_target_vector, LAYOUT_LEN
-from evaluate import _build_chunk_tokens
+from evaluate import _build_chunk_tokens_extended
 
 
 @torch.no_grad()
@@ -24,8 +24,8 @@ def rollout_selfplay(agent, words, device=None, batch_size=cfg.SELF_PLAY_BATCH,
     Returns: (input_ids [N,L] int64, attn [N,L] int64, targets [N,26] float32)
     """
     if len(words) == 0:
-        return (torch.zeros(0, LAYOUT_LEN, dtype=torch.long),
-                torch.zeros(0, LAYOUT_LEN, dtype=torch.long),
+        return (torch.zeros(0, cfg.LAYOUT_TOTAL_LEN, dtype=torch.long),
+                torch.zeros(0, cfg.LAYOUT_TOTAL_LEN, dtype=torch.long),
                 torch.zeros(0, cfg.NUM_LETTERS, dtype=torch.float32))
 
     agent.eval()
@@ -63,9 +63,9 @@ def rollout_selfplay(agent, words, device=None, batch_size=cfg.SELF_PLAY_BATCH,
             if len(active_idx) == 0:
                 break
             a_words = [chunk[i] for i in active_idx]
-            ids, am, gm = _build_chunk_tokens(
+            ids, am, gm = _build_chunk_tokens_extended(
                 a_words, revealed[active_idx],
-                [guessed_char_lists[i] for i in active_idx], LAYOUT_LEN)
+                [guessed_char_lists[i] for i in active_idx])
             ids_d = ids.to(device); am_d = am.to(device); gm_d = gm.to(device)
             with amp_ctx:
                 logits = agent.model(ids_d, am_d)

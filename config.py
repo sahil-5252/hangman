@@ -33,8 +33,17 @@ def _parse_cli():
         "max_train_steps", "max_mc_words_per_epoch",
         "self_play_batch", "mc_mix_ratio", "max_wrong_guesses",
         "correct_guess_prob",
-        "lr", "weight_decay", "lr_scheduler", "warmup_steps", "max_grad_norm",
+        "lr", "min_lr", "weight_decay", "lr_scheduler", "warmup_steps",
+        "warmup_ratio", "max_grad_norm",
         "device", "use_amp", "val_words", "num_workers",
+        # Exhaustive state generation
+        "exhaustive_cap_per_word", "exhaustive_ratio", "wrong_letters_min",
+        "wrong_letters_max", "wrong_letters_prob",
+        # Candidate inference
+        "candidate_alpha", "candidate_min_size", "candidate_max_size",
+        # Misc
+        "load_checkpoint_phase", "load_checkpoint_epoch", "load_checkpoint_round",
+        "load_checkpoint_global_step",
     }
     # Map CLI key (lowercase) -> module-level global name (UPPERCASE)
     _KEY_MAP = {k: k.upper() for k in _KNOWN}
@@ -140,10 +149,28 @@ DROPOUT = 0.1
 MAX_SEQ_LEN = 64
 MAX_WORD_LEN = 32
 
+# Layout: CLS(1) + guessed(26) + SEP(1) + word(32) = 60
+# The model also receives two 26-dim masks appended after the word tokens.
+# With correct_mask(26) + wrong_mask(26), total = 60 + 52 = 112 <= 128
+# We increase MAX_SEQ_LEN to 128 to accommodate the masks.
+MAX_SEQ_LEN = 128
 LAYOUT_GUESS_START = 1
-LAYOUT_GUESS_END = 27
+LAYOUT_GUESS_END = 27   # exclusive
 LAYOUT_SEP = 27
 LAYOUT_WORD_START = 28
+# Correct-letter mask: positions 60..85 (26 tokens)
+LAYOUT_CORRECT_START = 60
+# Wrong-letter mask: positions 86..111 (26 tokens)
+LAYOUT_WRONG_START = 86
+# Total used: 112 tokens
+LAYOUT_LEN = 60  # base layout for backward compatibility (CLS + 26 guessed + SEP + 32 word)
+LAYOUT_TOTAL_LEN = 112  # full length including correct/wrong masks
+
+# Correct/wrong mask token values: 1 = present, 0 = absent
+CORRECT_ONE = 1
+CORRECT_ZERO = 0
+WRONG_ONE = 1
+WRONG_ZERO = 0
 
 # ---------------------------------------------------------------------------
 # Training / optimisation
@@ -164,16 +191,37 @@ SELF_PLAY_BATCH = 4096
 MC_MIX_RATIO = 0.30
 MAX_WRONG_GUESSES = 6
 
+# ---------------------------------------------------------------------------
+# Bias sampling for MC state generation
+# ---------------------------------------------------------------------------
 CORRECT_GUESS_PROB = 0.40
+
+# ---------------------------------------------------------------------------
+# Exhaustive legal state generation
+# ---------------------------------------------------------------------------
+EXHAUSTIVE_CAP_PER_WORD = 64   # max exhaustive subsets per word (0 = unlimited)
+EXHAUSTIVE_RATIO = 0.70        # fraction of training data from exhaustive states
+WRONG_LETTERS_MIN = 0          # min wrong letters to attach to a state
+WRONG_LETTERS_MAX = 5          # max wrong letters (max 5 for non-terminal)
+WRONG_LETTERS_PROB = 0.50      # probability of adding wrong letters to a state
 
 # ---------------------------------------------------------------------------
 # Optimiser / scheduler
 # ---------------------------------------------------------------------------
 LR = 3e-4
+MIN_LR = 1e-5
 WEIGHT_DECAY = 1e-4
-LR_SCHEDULER = "cosine"
+LR_SCHEDULER = "cosine"       # "cosine" or "linear_warmup" or "constant"
 WARMUP_STEPS = 500
+WARMUP_RATIO = 0.0             # if > 0, warmup_steps = total_steps * WARMUP_RATIO
 MAX_GRAD_NORM = 1.0
+
+# ---------------------------------------------------------------------------
+# Candidate inference scoring
+# ---------------------------------------------------------------------------
+CANDIDATE_ALPHA = 0.70         # weight for CANINE probability in combined score
+CANDIDATE_MIN_SIZE = 1         # min candidate set size to use candidate score
+CANDIDATE_MAX_SIZE = 5000      # max candidate set size to use candidate score
 
 # ---------------------------------------------------------------------------
 # Mixed precision / device
@@ -205,6 +253,14 @@ NUM_WORKERS = 0
 # Logging
 # ---------------------------------------------------------------------------
 LOG_INTERVAL = 200
+
+# ---------------------------------------------------------------------------
+# Checkpoint resume metadata (populated when loading a checkpoint)
+# ---------------------------------------------------------------------------
+RESUME_PHASE = ""
+RESUME_EPOCH = 0
+RESUME_ROUND = 0
+RESUME_GLOBAL_STEP = 0
 
 # ---------------------------------------------------------------------------
 # Apply CLI overrides (after all defaults are defined)

@@ -11,6 +11,7 @@ fully reproducible and offline on Kaggle.
 import math
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 import config as cfg
 
@@ -32,7 +33,12 @@ class PositionalEncoding(nn.Module):
 
 class CanineHangmanModel(nn.Module):
     """Character-level transformer encoder consuming a Hangman state and
-    emitting a [B, 26] logits tensor of next-letter scores."""
+    emitting a [B, 26] logits tensor of next-letter scores.
+
+    Input layout (extended, 112 tokens):
+        [CLS] guessed[0..25] [SEP] word[0..31] correct_mask[0..25] wrong_mask[0..25]
+    Total: 1 + 26 + 1 + 32 + 26 + 26 = 112 <= MAX_SEQ_LEN=128
+    """
 
     def __init__(self, vocab_size=cfg.VOCAB_SIZE, dim=cfg.MODEL_DIM,
                  num_heads=cfg.NUM_HEADS, num_layers=cfg.NUM_LAYERS,
@@ -106,3 +112,19 @@ class HangmanAgent:
             all_guessed = guessed_mask.all(dim=-1)
             next_id = torch.where(all_guessed, torch.zeros_like(next_id), next_id)
         return next_id
+
+    @torch.no_grad()
+    def predict_proba(self, input_ids, attn_mask, guessed_mask=None):
+        """input_ids/attn_mask: tensors [B, T]; guessed_mask: [B, 26] bool.
+        Returns probability distribution over 26 letters [B, 26].
+        Already-guessed letters are set to 0, then renormalised."""
+        logits = self.model(input_ids, attn_mask)  # [B, 26]
+        if guessed_mask is not None:
+            logits = logits.masked_fill(guessed_mask, float("-inf"))
+        probs = F.softmax(logits, dim=-1)
+        # Zero out guessed letters and renormalise
+        if guessed_mask is not None:
+            probs = probs.masked_fill(guessed_mask, 0.0)
+            row_sum = probs.sum(dim=-1, keepdim=True).clamp(min=1e-12)
+            probs = probs / row_sum
+        return probs
